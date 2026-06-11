@@ -1,4 +1,4 @@
-#include <zygisk.hpp>
+#include "zygisk.hpp"
 #include <dlfcn.h>
 #include <cstring>
 #include <cstdio>
@@ -218,7 +218,7 @@ static unsigned long getauxval_hook(unsigned long type) {
 static int (*orig_dl_iterate_phdr)(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) = nullptr;
 
 static int dl_iterate_phdr_hook(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) {
-    auto wrapper = [](struct dl_phdr_info* info, size_t sz, void* d) -> int {
+    auto wrapper = [cb](struct dl_phdr_info* info, size_t sz, void* d) -> int {
         return filterPhdrCallback(info, sz, d, cb);
     };
     return orig_dl_iterate_phdr ? orig_dl_iterate_phdr(wrapper, data) : 0;
@@ -244,7 +244,6 @@ static void sigsysHandler(int sig, siginfo_t* info, void* ctx) {
             virtualFiles[fd] = new FakeFile(FAKE_AUXV, sizeof(FAKE_AUXV) - 1);
             retVal = fd;
         } else if (path && strstr(path, "/sys/devices/system/cpu")) {
-            // 直接返回 -1，不修改 errno (信号处理中修改 errno 不安全)
             retVal = -1;
         }
     } else if (syscallNr == __NR_read) {
@@ -335,10 +334,8 @@ public:
         // 关闭进程内存转储，禁止ptrace调试
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
-        // 进程退出回调，下发退出指令
-        args->onExit = [=]() {
-            sendCommand('\x00');
-        };
+        // 进程退出回调，下发退出指令（无捕获 lambda 自动转为函数指针）
+        args->onExit = []() { sendCommand('\x00'); };
     }
 
 private:
