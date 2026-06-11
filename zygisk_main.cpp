@@ -17,6 +17,10 @@
 #include <errno.h>
 #include <sys/ucontext.h>
 #include <link.h>
+#include <sys/prctl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <cstddef>
 
 // 条件编译内嵌必需宏，彻底避免重定义冲突
 #ifndef PR_SET_NO_NEW_PRIVS
@@ -50,19 +54,6 @@
 #ifndef __NR_close
 #define __NR_close 57
 #endif
-
-// 内嵌Linux BPF结构体，无系统依赖
-struct sock_filter {
-    unsigned short code;
-    unsigned char jt;
-    unsigned char jf;
-    unsigned int k;
-};
-
-struct sock_fprog {
-    unsigned short len;
-    struct sock_filter *filter;
-};
 
 using namespace zygisk;
 
@@ -203,13 +194,34 @@ std::string loadTargetPkg() {
 }
 
 // dl_phdr模块库过滤回调
-int filterPhdrCallback(struct dl_phdr_info* info, size_t size, void* data, int (*originCb)(struct dl_phdr_info*, size_t, void*)) {
+int filterPhdrCallback(struct dl_phdr_info* info, size_t size, void* data,
+                       int (*originCb)(struct dl_phdr_info*, size_t, void*)) {
     if (info && info->dlpi_name) {
         std::string libName(info->dlpi_name);
-        if (libName.find("kirin9000s") != std::string::npos || libName.find("cpu_spoof") != std::string::npos)
+        if (libName.find("kirin9000s") != std::string::npos ||
+            libName.find("cpu_spoof") != std::string::npos)
             return 0;
     }
     return originCb ? originCb(info, size, data) : 0;
+}
+
+// --- getauxval hook 相关 ---
+static unsigned long (*orig_getauxval)(unsigned long) = nullptr;
+
+static unsigned long getauxval_hook(unsigned long type) {
+    if (type == 16) return FAKE_HWCAP;
+    if (type == 26) return FAKE_HWCAP2;
+    return orig_getauxval ? orig_getauxval(type) : 0;
+}
+
+// --- dl_iterate_phdr hook 相关 ---
+static int (*orig_dl_iterate_phdr)(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) = nullptr;
+
+static int dl_iterate_phdr_hook(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) {
+    auto wrapper = [](struct dl_phdr_info* info, size_t sz, void* d) -> int {
+        return filterPhdrCallback(info, sz, d, cb);
+    };
+    return orig_dl_iterate_phdr ? orig_dl_iterate_phdr(wrapper, data) : 0;
 }
 
 // SIGSYS系统调用捕获处理函数
@@ -232,7 +244,7 @@ static void sigsysHandler(int sig, siginfo_t* info, void* ctx) {
             virtualFiles[fd] = new FakeFile(FAKE_AUXV, sizeof(FAKE_AUXV) - 1);
             retVal = fd;
         } else if (path && strstr(path, "/sys/devices/system/cpu")) {
-            errno = ENOENT;
+            // 直接返回 -1，不修改 errno (信号处理中修改 errno 不安全)
             retVal = -1;
         }
     } else if (syscallNr == __NR_read) {
@@ -290,28 +302,11 @@ public:
 
         // 1. Hook getauxval 篡改硬件指令集参数
         api->pltHookRegister(".*libc\\.so$", "getauxval",
-        [=](void* origFunc, void** outReal) {
-            *outReal = origFunc;
-            return [=](unsigned long type) -> unsigned long {
-                if (type == 16) return FAKE_HWCAP;
-                if (type == 26) return FAKE_HWCAP2;
-                using OrigFunc = unsigned long (*)(unsigned long);
-                return ((OrigFunc)*outReal)(type);
-            };
-        }, nullptr);
+                             (void*)getauxval_hook, (void**)&orig_getauxval);
 
         // 2. 过滤dl_iterate_phdr，隐藏模块库
         api->pltHookRegister(".*libc\\.so$", "dl_iterate_phdr",
-        [=](void* origFunc, void** outReal) {
-            *outReal = origFunc;
-            return [=](int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) -> int {
-                auto wrapCallback = [=](struct dl_phdr_info* info, size_t sz, void* d) -> int {
-                    return filterPhdrCallback(info, sz, d, cb);
-                };
-                using OrigFunc = int (*)(int(*)(struct dl_phdr_info*, size_t, void*), void*);
-                return ((OrigFunc)*outReal)(wrapCallback, data);
-            };
-        }, nullptr);
+                             (void*)dl_iterate_phdr_hook, (void**)&orig_dl_iterate_phdr);
 
         // 3. 注册Seccomp-BPF系统调用过滤器
         struct sock_filter bpfRules[] = {
