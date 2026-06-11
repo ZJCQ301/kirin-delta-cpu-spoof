@@ -10,11 +10,13 @@
 #include <sys/un.h>
 #include <atomic>
 #include <mutex>
+#include <map>
 #include <random>
 #include <ctime>
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/ucontext.h>
+#include <link.h>
 
 // 条件编译内嵌必需宏，彻底避免重定义冲突
 #ifndef PR_SET_NO_NEW_PRIVS
@@ -202,12 +204,12 @@ std::string loadTargetPkg() {
 
 // dl_phdr模块库过滤回调
 int filterPhdrCallback(struct dl_phdr_info* info, size_t size, void* data, int (*originCb)(struct dl_phdr_info*, size_t, void*)) {
-    if (info->dlpi_name) {
+    if (info && info->dlpi_name) {
         std::string libName(info->dlpi_name);
         if (libName.find("kirin9000s") != std::string::npos || libName.find("cpu_spoof") != std::string::npos)
             return 0;
     }
-    return originCb(info, size, data);
+    return originCb ? originCb(info, size, data) : 0;
 }
 
 // SIGSYS系统调用捕获处理函数
@@ -219,17 +221,17 @@ static void sigsysHandler(int sig, siginfo_t* info, void* ctx) {
 
     if (syscallNr == __NR_openat) {
         const char* path = reinterpret_cast<const char*>(regs[1]);
-        if (strstr(path, "/proc/cpuinfo")) {
+        if (path && strstr(path, "/proc/cpuinfo")) {
             int fd = nextFd.fetch_add(1);
             std::lock_guard<std::mutex> lock(fileMapMtx);
             virtualFiles[fd] = new FakeFile(FAKE_CPUINFO, sizeof(FAKE_CPUINFO) - 1);
             retVal = fd;
-        } else if (strstr(path, "/proc/self/auxv")) {
+        } else if (path && strstr(path, "/proc/self/auxv")) {
             int fd = nextFd.fetch_add(1);
             std::lock_guard<std::mutex> lock(fileMapMtx);
             virtualFiles[fd] = new FakeFile(FAKE_AUXV, sizeof(FAKE_AUXV) - 1);
             retVal = fd;
-        } else if (strstr(path, "/sys/devices/system/cpu")) {
+        } else if (path && strstr(path, "/sys/devices/system/cpu")) {
             errno = ENOENT;
             retVal = -1;
         }
@@ -262,6 +264,7 @@ static void sigsysHandler(int sig, siginfo_t* info, void* ctx) {
 class UltimateCpuSpoof : public ModuleBase {
 public:
     void onLoad(Api* api, JNIEnv* env) override {
+        this->api = api;
         targetPackage = loadTargetPkg();
         // 读取随机套接字路径
         std::ifstream sockFile("/data/adb/modules/kirin9000s_ultimate_spoof/running_state/sockpath.tmp");
@@ -275,6 +278,7 @@ public:
     }
 
     void preAppSpecialize(AppSpecializeArgs* args) override {
+        if (!api) return;
         const char* procName = api->getProcessName();
         if (!procName || targetPackage.empty()) return;
         size_t pkgLen = targetPackage.size();
@@ -288,7 +292,7 @@ public:
         api->pltHookRegister(".*libc\\.so$", "getauxval",
         [=](void* origFunc, void** outReal) {
             *outReal = origFunc;
-            return [](unsigned long type) -> unsigned long {
+            return [=](unsigned long type) -> unsigned long {
                 if (type == 16) return FAKE_HWCAP;
                 if (type == 26) return FAKE_HWCAP2;
                 using OrigFunc = unsigned long (*)(unsigned long);
@@ -300,8 +304,8 @@ public:
         api->pltHookRegister(".*libc\\.so$", "dl_iterate_phdr",
         [=](void* origFunc, void** outReal) {
             *outReal = origFunc;
-            return [](int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) -> int {
-                auto wrapCallback = [cb](struct dl_phdr_info* info, size_t sz, void* d) -> int {
+            return [=](int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) -> int {
+                auto wrapCallback = [=](struct dl_phdr_info* info, size_t sz, void* d) -> int {
                     return filterPhdrCallback(info, sz, d, cb);
                 };
                 using OrigFunc = int (*)(int(*)(struct dl_phdr_info*, size_t, void*), void*);
@@ -341,6 +345,9 @@ public:
             sendCommand('\x00');
         };
     }
+
+private:
+    Api* api = nullptr;
 };
 
 REGISTER_ZYGISK_MODULE(UltimateCpuSpoof)
