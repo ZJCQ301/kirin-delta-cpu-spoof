@@ -1,0 +1,9 @@
+id=kirin9000s_ultimate_spoof
+name=三角洲-麒麟9000S-用户态极限CPU伪装V4.0
+version=4.0
+versionCode=400
+author=Senior-Reverse-Engineer
+description=无挂载无命名空间，纯Seccomp内存虚拟文件方案；封堵auxv/sys时序漏洞；随机套接字、进程伪装；毫秒级崩溃巡检，适配ACE深层内核检测，Android15-ARM64。
+zygisk-module=true
+companion=true
+post-fs-data-mode=post-fs-data
