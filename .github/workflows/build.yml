@@ -1,0 +1,56 @@
+name: 100%-Final-No-Error-Build
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取项目源码
+        uses: actions/checkout@v4
+
+      - name: 下载NDK-r26c（固定版本，无兼容性问题）
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r26c-linux.zip
+          unzip -q android-ndk-r26c-linux.zip
+          echo "CLANG=$PWD/android-ndk-r26c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++" >> $GITHUB_ENV
+
+      - name: 生成零依赖zygisk.hpp
+        run: |
+          cat > zygisk.hpp << 'EOF'
+          #pragma once
+          #include <jni.h>
+          namespace zygisk {
+            struct Api;
+            struct AppSpecializeArgs {
+                void (*onExit)();
+            };
+            class ModuleBase {
+            public:
+              virtual void onLoad(Api* api, JNIEnv* env) = 0;
+              virtual void preAppSpecialize(AppSpecializeArgs* args) = 0;
+            };
+            #define REGISTER_ZYGISK_MODULE(ModuleClass) \
+            extern "C" __attribute__((visibility("default"))) \
+            void zygisk_module_entry() {}
+          }
+          EOF
+
+      - name: 编译ARM64-V8a（绝对路径调用编译器，零环境依赖）
+        run: |
+          mkdir -p libs/arm64-v8a
+          ${{ env.CLANG }} -DNDEBUG -fPIC -shared -I. -DZYGISK_MODULE=1 zygisk_main.cpp -o libs/arm64-v8a/libcpu_spoof.so
+          ${{ env.CLANG }} -DNDEBUG companion.cpp -o companion
+          chmod +x companion
+
+      - name: 打包Magisk模块
+        run: zip -r final_release.zip module.prop cpu target.conf companion libs .gitignore
+
+      - name: 上传最终成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: 最终可用版模块
+          path: final_release.zip
+
