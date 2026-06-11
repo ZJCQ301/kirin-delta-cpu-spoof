@@ -22,35 +22,28 @@
 #include <linux/seccomp.h>
 #include <cstddef>
 
-// 条件编译内嵌必需宏，彻底避免重定义冲突
+// 条件编译内嵌必需宏
 #ifndef PR_SET_NO_NEW_PRIVS
 #define PR_SET_NO_NEW_PRIVS 38
 #endif
-
 #ifndef PR_SET_SECCOMP
 #define PR_SET_SECCOMP 22
 #endif
-
 #ifndef SECCOMP_MODE_FILTER
 #define SECCOMP_MODE_FILTER 2
 #endif
-
 #ifndef SECCOMP_RET_TRAP
 #define SECCOMP_RET_TRAP 0x00030000
 #endif
-
 #ifndef SECCOMP_RET_ALLOW
 #define SECCOMP_RET_ALLOW 0x7fff0000
 #endif
-
 #ifndef __NR_openat
 #define __NR_openat 56
 #endif
-
 #ifndef __NR_read
 #define __NR_read 63
 #endif
-
 #ifndef __NR_close
 #define __NR_close 57
 #endif
@@ -141,12 +134,11 @@ CPU revision    : 0
 Hardware        : HiSilicon Kirin 9000S
 )";
 
-// 伪造auxv硬件向量数据
 constexpr const char FAKE_AUXV[] = "\x10\x00\x00\x00\xef\xfe\xef\x7E\x1A\x00\x00\x00\x1F\x00\x00\x00";
 constexpr unsigned long FAKE_HWCAP = 0x7efefeff;
 constexpr unsigned long FAKE_HWCAP2 = 0x0000001f;
 
-// 内存虚拟文件结构体
+// 内存虚拟文件
 struct FakeFile {
     const char* data;
     size_t dataSize;
@@ -161,7 +153,6 @@ std::map<int, FakeFile*> virtualFiles;
 std::string targetPackage;
 std::string socketPath;
 
-// 15-80μs 原生随机时延模拟
 void simulateNativeReadLatency() {
     static thread_local std::mt19937 rng(static_cast<unsigned int>(time(nullptr)));
     long usec = 15 + (rng() % 65);
@@ -169,7 +160,6 @@ void simulateNativeReadLatency() {
     nanosleep(&ts, nullptr);
 }
 
-// 套接字发送启停指令
 void sendCommand(char cmd) {
     int sockFd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
     struct sockaddr_un unAddr{};
@@ -180,7 +170,6 @@ void sendCommand(char cmd) {
     close(sockFd);
 }
 
-// 读取目标游戏包名
 std::string loadTargetPkg() {
     std::ifstream conf("/data/adb/modules/kirin9000s_ultimate_spoof/target.conf");
     std::string pkg;
@@ -188,12 +177,10 @@ std::string loadTargetPkg() {
         getline(conf, pkg);
         conf.close();
     }
-    // 读取失败使用默认三角洲包名兜底
     if (pkg.empty()) pkg = "com.tencent.tmgp.dfm";
     return pkg;
 }
 
-// dl_phdr模块库过滤回调
 int filterPhdrCallback(struct dl_phdr_info* info, size_t size, void* data,
                        int (*originCb)(struct dl_phdr_info*, size_t, void*)) {
     if (info && info->dlpi_name) {
@@ -205,26 +192,34 @@ int filterPhdrCallback(struct dl_phdr_info* info, size_t size, void* data,
     return originCb ? originCb(info, size, data) : 0;
 }
 
-// --- getauxval hook 相关 ---
+// ---------- getauxval hook ----------
 static unsigned long (*orig_getauxval)(unsigned long) = nullptr;
-
 static unsigned long getauxval_hook(unsigned long type) {
     if (type == 16) return FAKE_HWCAP;
     if (type == 26) return FAKE_HWCAP2;
     return orig_getauxval ? orig_getauxval(type) : 0;
 }
 
-// --- dl_iterate_phdr hook 相关 ---
+// ---------- dl_iterate_phdr hook ----------
 static int (*orig_dl_iterate_phdr)(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) = nullptr;
 
-static int dl_iterate_phdr_hook(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) {
-    auto wrapper = [cb](struct dl_phdr_info* info, size_t sz, void* d) -> int {
-        return filterPhdrCallback(info, sz, d, cb);
-    };
-    return orig_dl_iterate_phdr ? orig_dl_iterate_phdr(wrapper, data) : 0;
+// 包装回调：从 data 中提取原始 cb 和原始 data
+struct CallbackWrapData {
+    int (*orig_cb)(struct dl_phdr_info*, size_t, void*);
+    void* orig_data;
+};
+
+static int phdrWrapper(struct dl_phdr_info* info, size_t sz, void* data) {
+    CallbackWrapData* wrap = static_cast<CallbackWrapData*>(data);
+    return filterPhdrCallback(info, sz, wrap->orig_data, wrap->orig_cb);
 }
 
-// SIGSYS系统调用捕获处理函数
+static int dl_iterate_phdr_hook(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) {
+    CallbackWrapData wrap{cb, data};
+    return orig_dl_iterate_phdr(phdrWrapper, &wrap);
+}
+
+// ---------- SIGSYS 处理 ----------
 static void sigsysHandler(int sig, siginfo_t* info, void* ctx) {
     ucontext_t* ctxUc = reinterpret_cast<ucontext_t*>(ctx);
     unsigned long* regs = reinterpret_cast<unsigned long*>(&ctxUc->uc_mcontext);
@@ -272,18 +267,17 @@ static void sigsysHandler(int sig, siginfo_t* info, void* ctx) {
     regs[0] = retVal;
 }
 
+// ---------- Zygisk 模块 ----------
 class UltimateCpuSpoof : public ModuleBase {
 public:
     void onLoad(Api* api, JNIEnv* env) override {
         this->api = api;
         targetPackage = loadTargetPkg();
-        // 读取随机套接字路径
         std::ifstream sockFile("/data/adb/modules/kirin9000s_ultimate_spoof/running_state/sockpath.tmp");
         if (sockFile.is_open()) {
             getline(sockFile, socketPath);
             sockFile.close();
         }
-        // 运行期擦除内存明文关键字
         char keyword[] = "cpu_spoof";
         memset(keyword, 0, sizeof(keyword));
     }
@@ -293,21 +287,20 @@ public:
         const char* procName = api->getProcessName();
         if (!procName || targetPackage.empty()) return;
         size_t pkgLen = targetPackage.size();
-        // 前缀匹配游戏子进程
         bool isTargetProc = (strncmp(procName, targetPackage.c_str(), pkgLen) == 0);
         if (!isTargetProc) return;
 
         sendCommand('\x01');
 
-        // 1. Hook getauxval 篡改硬件指令集参数
+        // Hook getauxval
         api->pltHookRegister(".*libc\\.so$", "getauxval",
                              (void*)getauxval_hook, (void**)&orig_getauxval);
 
-        // 2. 过滤dl_iterate_phdr，隐藏模块库
+        // Hook dl_iterate_phdr
         api->pltHookRegister(".*libc\\.so$", "dl_iterate_phdr",
                              (void*)dl_iterate_phdr_hook, (void**)&orig_dl_iterate_phdr);
 
-        // 3. 注册Seccomp-BPF系统调用过滤器
+        // Seccomp-BPF 规则
         struct sock_filter bpfRules[] = {
             BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 0, 1),
@@ -323,18 +316,14 @@ public:
             .filter = bpfRules
         };
 
-        // 配置SIGSYS信号处理器
         struct sigaction sigAction{};
         sigAction.sa_sigaction = sigsysHandler;
         sigAction.sa_flags = SA_SIGINFO | SA_NODEFER;
         sigaction(SIGSYS, &sigAction, nullptr);
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &seccompProg, 0, 0);
-
-        // 关闭进程内存转储，禁止ptrace调试
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
-        // 进程退出回调，下发退出指令（无捕获 lambda 自动转为函数指针）
         args->onExit = []() { sendCommand('\x00'); };
     }
 
