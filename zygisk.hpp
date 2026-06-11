@@ -2,7 +2,6 @@
 #define ZYGISK_HPP
 
 #include <jni.h>
-#include <string>
 
 namespace zygisk {
 
@@ -11,7 +10,7 @@ struct AppSpecializeArgs {
     jobject nice_name;
     jstring app_data_dir;
     const char* const* rlimits;
-    void (*onExit)();   // 进程退出回调
+    void (*onExit)();
 };
 
 struct ServerSpecializeArgs {
@@ -21,14 +20,18 @@ struct ServerSpecializeArgs {
 
 class Api {
 public:
-    virtual ~Api() = default;
+    virtual ~Api() {}
     virtual const char* getProcessName() const = 0;
+    
+    // 使用 void* 避免类型依赖，实际使用时会强制转换
     virtual void pltHookRegister(const char* regex, const char* symbol, void* newFunc, void** oldFunc) = 0;
+    
+    // 某些版本需要额外参数，这里不做要求
 };
 
 class ModuleBase {
 public:
-    virtual ~ModuleBase() = default;
+    virtual ~ModuleBase() {}
     virtual void onLoad(Api* api, JNIEnv* env) {}
     virtual void preAppSpecialize(AppSpecializeArgs* args) {}
     virtual void postAppSpecialize(const AppSpecializeArgs* args) {}
