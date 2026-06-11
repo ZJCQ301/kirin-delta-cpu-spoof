@@ -24,7 +24,6 @@ public:
     virtual ~Api() = default;
     virtual const char* getProcessName() const = 0;
     virtual void pltHookRegister(const char* regex, const char* symbol, void* newFunc, void** oldFunc) = 0;
-    // 其他必要方法（根据需求可扩展）
 };
 
 class ModuleBase {
